@@ -76,3 +76,7 @@ ANTHROPIC_OAUTH_TOKEN=... bun test/real-anthropic.ts   # real API: replay must r
 ```
 
 `test/fake-anthropic.ts` is a fake Anthropic API for end-to-end runs with `opencode serve` and opencode-anth. It logs every request with its `max_tokens` and whether its billing hash is valid.
+
+## Development
+
+`tui.js` is generated from `tui.tsx`: run `bun install && bun scripts/build-tui.ts` after editing it. Installed plugins live under `node_modules`, where OpenTUI's runtime Solid transform does not run, so the published TUI entry has to be precompiled. A local checkout loads `tui.tsx` directly.
