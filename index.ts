@@ -5,6 +5,7 @@
 // its cache entry expires, only while the expected savings are at least $0.05.
 
 import { createHash, randomUUID } from "node:crypto"
+import { Definition, type Snapshot } from "./rpc.ts"
 
 const PLUGIN_ID = "opencode-cache-warmer"
 
@@ -401,6 +402,8 @@ export interface WarmerDeps {
   fetch: (url: string, init: RequestInit) => Promise<Response>
   onWarmed: (sessionID: string, model: { providerID: string; id: string }, tokens: Tokens, cost: number) => void
   log: (...args: unknown[]) => void
+  /** Called whenever a session's warming status changes. */
+  onChange?: (sessionID: string) => void
 }
 
 export function lifetimeSeconds(
@@ -424,6 +427,10 @@ export class Warmer {
   private inactive = new Map<string, Status>()
 
   constructor(private deps: WarmerDeps) {}
+
+  phase(sessionID: string) {
+    return this.runs.get(sessionID)?.phase
+  }
 
   status(sessionID: string): Status {
     if (this.deps.mode() === "off") return { state: "inactive", reason: "cache warming disabled" }
@@ -466,6 +473,7 @@ export class Warmer {
     this.runs.set(sessionID, run)
     this.deps.log(sessionID, `start: ${request.retention} lifetime ${seconds}s, refresh every ${delayMs / 1000}s`)
     this.schedule(run, request.sentAt)
+    this.deps.onChange?.(sessionID)
   }
 
   /** A new request replaced the cache entry but cannot be warmed. */
@@ -481,7 +489,8 @@ export class Warmer {
     run.phase = "idle"
     this.deps.log(sessionID, "run settled: idle warming")
     const deadline = run.startedAt + MAX_IDLE_WARMING_AGE_MS
-    if (run.nextWarmAt > deadline || Date.now() >= deadline) this.stop(sessionID, "30-minute idle safety limit reached")
+    if (run.nextWarmAt > deadline || Date.now() >= deadline) return this.stop(sessionID, "30-minute idle safety limit reached")
+    this.deps.onChange?.(sessionID)
   }
 
   /** The conversation context changed at `at` (model/agent switch, revert, compaction, deletion). */
@@ -506,6 +515,7 @@ export class Warmer {
     this.clearRun(sessionID)
     this.inactive.set(sessionID, { state: "inactive", reason, ...(decision ? { decision } : {}) })
     this.deps.log(sessionID, "stop:", reason)
+    this.deps.onChange?.(sessionID)
   }
 
   private schedule(run: Run, from = Date.now()) {
@@ -552,6 +562,7 @@ export class Warmer {
       const reason = decision.economicsAvailable ? "expected savings below threshold" : "cache economics unavailable"
       return this.stop(run.sessionID, reason, decision)
     }
+    this.deps.onChange?.(run.sessionID)
     try {
       const headers = new Headers(run.headers)
       headers.delete("content-length")
@@ -577,7 +588,9 @@ export class Warmer {
       // Cache warming is best-effort and must not affect the session.
       if (!run.controller.signal.aborted) this.deps.log(run.sessionID, "refresh error:", String(error))
     }
-    if (this.runs.get(run.sessionID) === run) this.schedule(run)
+    if (this.runs.get(run.sessionID) !== run) return
+    this.schedule(run)
+    if (this.runs.get(run.sessionID) === run) this.deps.onChange?.(run.sessionID)
   }
 }
 
@@ -617,10 +630,14 @@ export default {
         try {
           const result = await ctx.model.list()
           const next = new Map<string, Rate[]>()
-          for (const info of result?.data ?? []) {
-            const rates = Array.isArray(info.cost) ? info.cost : []
-            next.set(`${info.providerID}/${info.modelID ?? info.id}`, rates)
-            next.set(`${info.providerID}/${info.id}`, rates)
+          const models: any[] = result?.data ?? []
+          const ratesOf = (info: any): Rate[] => (Array.isArray(info.cost) ? info.cost : [])
+          // Exact ids win: variants such as `claude-opus-5-5-fast` share `modelID` with the base model
+          // but have their own (higher) prices.
+          for (const info of models) next.set(`${info.providerID}/${info.id}`, ratesOf(info))
+          for (const info of models) {
+            const key = `${info.providerID}/${info.modelID}`
+            if (info.modelID && !next.has(key)) next.set(key, ratesOf(info))
           }
           rateTable = next
         } catch (error) {
@@ -646,24 +663,70 @@ export default {
       return d
     }
 
-    // Ledger writes are serialized per session so concurrent updates don't lose records.
+    // Per-session ledgers: loaded from storage once, then kept in memory; writes are serialized.
+    const ledgers = new Map<string, Promise<SessionLedger>>()
+    const ledger = (sessionID: string) => {
+      let loaded = ledgers.get(sessionID)
+      if (!loaded) {
+        loaded = (async () => {
+          try {
+            const stored = (await ctx.storage.get(`session/${sessionID}`)) as SessionLedger | undefined
+            if (stored && stored.warms && stored.misses) return stored
+          } catch (error) {
+            log("ledger read failed:", String(error))
+          }
+          return emptyLedger()
+        })()
+        ledgers.set(sessionID, loaded)
+      }
+      return loaded
+    }
     const ledgerWrites = new Map<string, Promise<void>>()
-    const updateLedger = (sessionID: string, update: (ledger: SessionLedger) => void) => {
+    const updateLedger = (sessionID: string, update: (ledger: SessionLedger) => void, notice?: string) => {
       const next = (ledgerWrites.get(sessionID) ?? Promise.resolve()).then(async () => {
         try {
-          const key = `session/${sessionID}`
-          const stored = (await ctx.storage.get(key)) as SessionLedger | undefined
-          const ledger = stored && stored.warms && stored.misses ? stored : emptyLedger()
-          update(ledger)
-          ledger.warms.recent = ledger.warms.recent.slice(-MAX_RECORDS)
-          ledger.misses.recent = ledger.misses.recent.slice(-MAX_RECORDS)
-          await ctx.storage.set(key, ledger as any)
+          const current = await ledger(sessionID)
+          update(current)
+          current.warms.recent = current.warms.recent.slice(-MAX_RECORDS)
+          current.misses.recent = current.misses.recent.slice(-MAX_RECORDS)
+          await ctx.storage.set(`session/${sessionID}`, current as any)
         } catch (error) {
           log("ledger write failed:", String(error))
         }
+        await notify(sessionID, notice)
       })
       ledgerWrites.set(sessionID, next)
       return next
+    }
+
+    const snapshot = async (sessionID: string, notice?: string): Promise<Snapshot> => {
+      const status = warmer.status(sessionID)
+      const l = await ledger(sessionID)
+      const d = status.decision
+      return {
+        sessionID,
+        mode,
+        serverNow: Date.now(),
+        state: status.state,
+        ...(status.reason ? { reason: status.reason } : {}),
+        ...(status.nextWarmAt ? { nextWarmAt: status.nextWarmAt } : {}),
+        ...(d
+          ? { phase: d.phase, expectedSavings: d.expectedSavings, action: d.action, economicsAvailable: d.economicsAvailable }
+          : {}),
+        line: formatStatus(status),
+        warms: { count: l.warms.count, cost: l.warms.cost },
+        misses: { count: l.misses.count, tokens: l.misses.tokens, cost: l.misses.cost },
+        ...(notice ? { notice } : {}),
+      }
+    }
+    let rpc: { events: { emit: (name: "update", data: any) => Promise<void> } } | undefined
+    const notify = async (sessionID: string, notice?: string) => {
+      if (!rpc) return
+      try {
+        await rpc.events.emit("update", await snapshot(sessionID, notice))
+      } catch (error) {
+        log("rpc emit failed:", String(error))
+      }
     }
 
     const warmer = new Warmer({
@@ -674,6 +737,7 @@ export default {
       promptTokens: (sessionID) => promptTokens.get(sessionID) ?? 0,
       fetch: (url, init) => fetch(url, init),
       log,
+      onChange: (sessionID) => void notify(sessionID),
       onWarmed: (sessionID, model, tokens, cost) => {
         const time = Date.now()
         detector(sessionID).onWarm(tokens, modelKey(model), time)
@@ -730,6 +794,14 @@ export default {
       }
     }
 
+    try {
+      rpc = await ctx.rpc.register(Definition as any, {
+        status: async (input: { sessionID: string }) => snapshot(input.sessionID),
+      })
+    } catch (error) {
+      log("rpc register failed:", String(error))
+    }
+
     // Session events: run settlement, context changes, and per-step usage for miss detection.
     const abort = new AbortController()
     const handle = (event: any) => {
@@ -768,6 +840,7 @@ export default {
           warmer.onContextChanged(sessionID, at, "session deleted")
           promptTokens.delete(sessionID)
           detectors.delete(sessionID)
+          ledgers.delete(sessionID)
           lastModel.delete(sessionID)
           sendTimes.delete(sessionID)
           return
@@ -783,12 +856,16 @@ export default {
           const record: MissRecord = { time: at, model: modelKey(model), ...miss }
           const notice = formatMiss(record)
           if (notice) log(sessionID, notice)
-          void updateLedger(sessionID, (ledger) => {
-            ledger.misses.count++
-            ledger.misses.tokens += miss.missedTokens
-            ledger.misses.cost += miss.missedCost
-            ledger.misses.recent.push(record)
-          })
+          void updateLedger(
+            sessionID,
+            (ledger) => {
+              ledger.misses.count++
+              ledger.misses.tokens += miss.missedTokens
+              ledger.misses.cost += miss.missedCost
+              ledger.misses.recent.push(record)
+            },
+            notice,
+          )
           return
         }
       }
@@ -804,9 +881,10 @@ export default {
       }
     })()
 
-    return () => {
+    return async () => {
       abort.abort()
       warmer.cancelAll()
+      await (rpc as any)?.dispose?.()
     }
   },
 }

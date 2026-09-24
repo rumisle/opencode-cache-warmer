@@ -74,7 +74,11 @@ const server = Bun.serve({
     )
     seenPrefix.add(withoutMax)
 
-    const usage = { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: PROMPT, cache_creation_input_tokens: 50 }
+    // A prompt containing MISS (in the latest user turn) gets a full cache miss.
+    const lastUser = JSON.stringify(parsed.messages?.at(-1) ?? "")
+    const usage = lastUser.includes("MISS") && !warm
+      ? { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: PROMPT + 50 }
+      : { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: PROMPT, cache_creation_input_tokens: 50 }
     if (warm) return sse(message([], "max_tokens", usage))
     if (tools.includes("Bash") && !text.includes('"tool_result"') && text.includes("SLEEP"))
       return sse(message([{ type: "tool_use", id: `toolu_${Date.now()}`, name: "Bash", input: { command: `sleep ${SLEEP}` } }], "tool_use", usage))
