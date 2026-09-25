@@ -351,6 +351,23 @@ export function formatMiss(miss: Pick<MissRecord, "missedTokens" | "missedCost" 
   return `${label}: ${tokens} tokens re-billed${cost}`
 }
 
+const usd = (value: number) => (value >= 0.01 ? `$${value.toFixed(2)}` : "<$0.01")
+const kTokens = (value: number) => (value >= 1000 ? `${Math.round(value / 1000)}k` : String(value))
+
+/** Transcript notice for a significant miss ("headline · details"), or undefined below pi's threshold. */
+export function missNotice(miss: Pick<MissRecord, "missedTokens" | "missedCost" | "idleMs" | "modelChanged">) {
+  if (!formatMiss(miss)) return undefined
+  let label = "Cache miss"
+  if (miss.modelChanged) label = "Cache miss after model switch"
+  else if (miss.idleMs >= CACHE_TTL_MS) label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`
+  return [label, `${kTokens(miss.missedTokens)} tokens re-billed`, ...(miss.missedCost >= 0.01 ? [`~${usd(miss.missedCost)}`] : [])].join(" · ")
+}
+
+/** Transcript notice for a run of refreshes with nothing sent in between. */
+export function warmNotice(stretch: { count: number; cost: number }) {
+  return `Cache kept warm · ${stretch.count} refresh${stretch.count === 1 ? "" : "es"} · ${usd(stretch.cost)}`
+}
+
 export function formatStatus(status: Status, now = Date.now()): string {
   const d = status.decision
   if (!d || (status.state === "inactive" && !d.economicsAvailable)) return `Inactive (${status.reason ?? "unknown reason"})`
@@ -663,6 +680,38 @@ export default {
       return d
     }
 
+    // Transcript notices (ocelot's session.notice; stock OpenCode has none, so they are skipped).
+    // Refreshes with nothing sent in between share one notice that is updated in place, and their
+    // cost counts toward the session's cost like pi's cache_warm usage entries.
+    const canNotice = typeof ctx.session?.notice === "function"
+    const stretches = new Map<string, { id?: Promise<string | undefined>; count: number; cost: number }>()
+    const postNotice = async (input: { sessionID: string; id?: string; level: "info" | "warning"; text: string; usage?: unknown }) => {
+      if (!canNotice) return undefined
+      try {
+        const result = await ctx.session.notice({ ...input, source: PLUGIN_ID })
+        return (result?.id ?? result?.data?.id) as string | undefined
+      } catch (error) {
+        log(input.sessionID, "notice failed:", String(error))
+      }
+    }
+    const noticeWarm = (sessionID: string, tokens: Tokens, cost: number) => {
+      const stretch = stretches.get(sessionID) ?? { count: 0, cost: 0 }
+      stretches.set(sessionID, stretch)
+      stretch.count++
+      stretch.cost += cost
+      const usage = {
+        cost,
+        tokens: { input: tokens.input, output: tokens.output, reasoning: 0, cache: { read: tokens.cacheRead, write: tokens.cacheWrite } },
+      }
+      const text = warmNotice(stretch)
+      // Updates wait for the first post so they carry its id.
+      const previous = stretch.id
+      stretch.id = (async () => {
+        const id = await previous
+        return (await postNotice({ sessionID, id, level: "info", text, usage })) ?? id
+      })()
+    }
+
     // Per-session ledgers: loaded from storage once, then kept in memory; writes are serialized.
     const ledgers = new Map<string, Promise<SessionLedger>>()
     const ledger = (sessionID: string) => {
@@ -741,6 +790,7 @@ export default {
       onWarmed: (sessionID, model, tokens, cost) => {
         const time = Date.now()
         detector(sessionID).onWarm(tokens, modelKey(model), time)
+        noticeWarm(sessionID, tokens, cost)
         void updateLedger(sessionID, (ledger) => {
           ledger.warms.count++
           ledger.warms.cost += cost
@@ -755,7 +805,10 @@ export default {
       ...Object.keys(options.lifetimes ?? {}).map((key) => key.split("/")[0]!),
     ])
     const onRequest = (event: any) => {
-      if (event.kind === "primary") sendTimes.set(event.sessionID, Date.now())
+      if (event.kind !== "primary") return
+      sendTimes.set(event.sessionID, Date.now())
+      // A real request ends the current run of refreshes: the next one starts a new notice.
+      stretches.delete(event.sessionID)
     }
     const onResponse = async (event: any) => {
       if (event.kind !== "primary") return
@@ -840,6 +893,7 @@ export default {
           warmer.onContextChanged(sessionID, at, "session deleted")
           promptTokens.delete(sessionID)
           detectors.delete(sessionID)
+          stretches.delete(sessionID)
           ledgers.delete(sessionID)
           lastModel.delete(sessionID)
           sendTimes.delete(sessionID)
@@ -856,6 +910,8 @@ export default {
           const record: MissRecord = { time: at, model: modelKey(model), ...miss }
           const notice = formatMiss(record)
           if (notice) log(sessionID, notice)
+          const text = missNotice(record)
+          if (text) void postNotice({ sessionID, level: "warning", text })
           void updateLedger(
             sessionID,
             (ledger) => {

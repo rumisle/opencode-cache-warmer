@@ -4,6 +4,8 @@ import {
   evaluate,
   formatMiss,
   formatStatus,
+  missNotice,
+  warmNotice,
   getCacheWarmingDelayMs,
   lifetimeSeconds,
   MissDetector,
@@ -161,6 +163,10 @@ describe("miss detection (pi cache-stats parity)", () => {
     expect(miss.modelChanged).toBe(false)
     expect(miss.missedCost).toBeCloseTo(50_810 * ((10 * 4 + 51_000 * 5) / 51_010 - 0.2) / 1e6, 9)
     expect(formatMiss(miss)).toBe("Cache miss after 7m idle: 51k tokens re-billed (~$0.24)")
+    expect(missNotice(miss)).toBe("Cache miss after 7m idle · 51k tokens re-billed · ~$0.24")
+    expect(missNotice({ ...miss, missedTokens: 5_000, missedCost: 0.02 })).toBeUndefined()
+    expect(warmNotice({ count: 1, cost: 0.004 })).toBe("Cache kept warm · 1 refresh · <$0.01")
+    expect(warmNotice({ count: 3, cost: 0.0456 })).toBe("Cache kept warm · 3 refreshes · $0.05")
   })
 
   test("warms re-anchor the baseline; compaction resets it; model switches are flagged", () => {

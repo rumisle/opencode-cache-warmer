@@ -42,6 +42,15 @@ Options:
 
 `OPENCODE_CACHE_WARMER_DEBUG=1` logs each start, refresh, stop reason, and cache miss to stderr (`opencode serve --print-logs`).
 
+## Transcript notices (ocelot)
+
+On [ocelot](https://github.com/rumisle/ocelot) (patch `core/session-notices`), the plugin also posts notices into the session transcript, which the web app and the TUI show. The model never sees them.
+
+- `Cache kept warm · 3 refreshes · $0.09`: one notice per run of refreshes with nothing sent in between, updated in place. Each refresh's usage counts toward the session's cost and tokens, like pi's `cache_warm` usage entries.
+- `Cache miss after 7m idle · 150k tokens re-billed · ~$0.72` (a warning): significant misses, pi's threshold (20k+ tokens or $0.10+).
+
+Stock OpenCode has no notices, so there the plugin skips them.
+
 ## TUI sidebar
 
 The package also has a TUI half (`./tui`), which the OpenCode TUI loads automatically for an installed server plugin. It adds a **Cache** block to the session sidebar:
