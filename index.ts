@@ -890,6 +890,10 @@ export default {
           if (run && data.agent !== run.agent) warmer.onContextChanged(sessionID, at)
           return
         }
+        // After a move the session's events and requests belong to the new location's instance, which
+        // warms it from its next request; this one must stop, or both would warm it.
+        case "session.moved":
+          return warmer.onContextChanged(sessionID, at, "session moved to another location")
         case "session.revert.staged":
         case "session.revert.committed":
         case "session.compaction.started":
