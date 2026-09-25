@@ -857,7 +857,18 @@ export default {
 
     // Session events: run settlement, context changes, and per-step usage for miss detection.
     const abort = new AbortController()
+    // The server runs one instance of this plugin per location (directory) but delivers every
+    // location's events to each. Only the instance whose location the session is in handles them:
+    // it is the one that sees the session's requests and warms it, so its miss detector also sees
+    // the warms. (Otherwise every instance counts, and posts, each miss.)
+    const here = ctx.location as { directory?: string; workspaceID?: string } | undefined
+    const mine = (event: any) => {
+      const at = event?.location
+      if (!at || !here?.directory) return true
+      return at.directory === here.directory && (at.workspaceID ?? undefined) === (here.workspaceID ?? undefined)
+    }
     const handle = (event: any) => {
+      if (!mine(event)) return
       const data = event?.data ?? {}
       const sessionID: string | undefined = data.sessionID
       if (!sessionID) return
